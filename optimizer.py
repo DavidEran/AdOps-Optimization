@@ -9,6 +9,7 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
 from io import BytesIO
+import datetime
 
 
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
@@ -66,15 +67,13 @@ def parse_pct(val):
 def merge_advertiser_data(internal, advertiser, kpi_col_idx_d7, kpi_col_idx_d2nd):
     """
     Merge ROI columns from advertiser file into internal file.
-    kpi_col_idx_d7: 0-based column index for D7 KPI (e.g. 8 for column I)
-    kpi_col_idx_d2nd: 0-based column index for D2nd KPI (e.g. 10 for column K)
+    kpi_col_idx_d7: 0-based column index for Main KPI
+    kpi_col_idx_d2nd: 0-based column index for Secondary KPI
     Returns (merged_df, d7_col_name, d2nd_col_name)
     """
-    # Detect column names
     d7_col_raw   = advertiser.columns[kpi_col_idx_d7]
     d2nd_col_raw = advertiser.columns[kpi_col_idx_d2nd]
 
-    # Build friendly label from column name (e.g. "Full ROAS D30" → "ROI D30")
     def label(col):
         c = col.strip()
         for prefix in ['Full ROAS ', 'ROAS ', 'Full Roas ', 'ROI ']:
@@ -86,13 +85,10 @@ def merge_advertiser_data(internal, advertiser, kpi_col_idx_d7, kpi_col_idx_d2nd
     d7_label   = label(d7_col_raw)
     d2nd_label = label(d2nd_col_raw)
 
-    # Parse percentages
     advertiser = advertiser.copy()
     advertiser[d7_label]   = advertiser[d7_col_raw].apply(parse_pct)
     advertiser[d2nd_label] = advertiser[d2nd_col_raw].apply(parse_pct)
 
-    # Detect key columns in advertiser file
-    # Common patterns: 'Campaign Name', 'Campaign', 'campaign_name'
     camp_col = next((c for c in advertiser.columns if 'campaign' in c.lower() and 'name' in c.lower()), None)
     if camp_col is None:
         camp_col = next((c for c in advertiser.columns if 'campaign' in c.lower()), None)
@@ -125,9 +121,9 @@ def kpi_target(kpi_d7, kpi_d2nd, w_d7=0.80, w_d2nd=0.20):
     return w_d7 * kpi_d7 + w_d2nd * kpi_d2nd
 
 
-def segment_row(roi_d7, roi_d2nd, kpi_d7, kpi_d2nd):
-    score  = weighted_score(roi_d7, roi_d2nd)
-    target = kpi_target(kpi_d7, kpi_d2nd)
+def segment_row(roi_d7, roi_d2nd, kpi_d7, kpi_d2nd, w_d7=0.80, w_d2nd=0.20):
+    score  = weighted_score(roi_d7, roi_d2nd, w_d7, w_d2nd)
+    target = kpi_target(kpi_d7, kpi_d2nd, w_d7, w_d2nd)
     if score >= target:
         return 'green'
     if roi_d7 == 0 and roi_d2nd == 0:
@@ -142,8 +138,8 @@ def segment_row(roi_d7, roi_d2nd, kpi_d7, kpi_d2nd):
 
 def segment_single(val, kpi):
     """Segment a single ROI value against its own KPI (used for poor progression check)."""
-    if val >= kpi:      return 'green'
-    if val == 0:        return 'red'
+    if val >= kpi:        return 'green'
+    if val == 0:          return 'red'
     pct_below = (kpi - val) / kpi
     if pct_below <= 0.50: return 'yellow'
     if pct_below < 1.0:   return 'orange'
@@ -161,9 +157,11 @@ def get_progression(roi_d7, roi_d2nd):
     return 'flat'
 
 
-def add_segments(df, d7_col, d2nd_col, kpi_d7, kpi_d2nd):
+def add_segments(df, d7_col, d2nd_col, kpi_d7, kpi_d2nd, w_d7=0.80, w_d2nd=0.20):
     df = df.copy()
-    df['segment']    = df.apply(lambda r: segment_row(r[d7_col], r[d2nd_col], kpi_d7, kpi_d2nd), axis=1)
+    df['segment']    = df.apply(
+        lambda r: segment_row(r[d7_col], r[d2nd_col], kpi_d7, kpi_d2nd, w_d7, w_d2nd), axis=1
+    )
     df['progression'] = df.apply(lambda r: get_progression(r[d7_col], r[d2nd_col]), axis=1)
     return df
 
@@ -171,13 +169,13 @@ def add_segments(df, d7_col, d2nd_col, kpi_d7, kpi_d2nd):
 # ─── STEP 3: DISCARD LOGIC ────────────────────────────────────────────────────
 
 def should_discard(row):
-    is_green   = row['segment'] == 'green'
-    installs   = row['installs'] if pd.notna(row['installs']) else 0
-    spend      = row['spend']
-    preloads   = row['preloads']
+    is_green    = row['segment'] == 'green'
+    installs    = row['installs'] if pd.notna(row['installs']) else 0
+    spend       = row['spend']
+    preloads    = row['preloads']
     progression = row['progression']
-    fill_rate  = row['fillRate'] if pd.notna(row['fillRate']) else 0
-    d7         = row.get('_roi_d7', 0)
+    fill_rate   = row['fillRate'] if pd.notna(row['fillRate']) else 0
+    d7          = row.get('_roi_d7', 0)
 
     # Green exception: green + 5+ installs overrides spend AND preloads thresholds
     if is_green and installs >= 5:
@@ -218,7 +216,7 @@ def get_daily_cap_suggestion(row, d7_col, d2nd_col):
 
 # ─── STEP 5: BID OPTIMIZATION ─────────────────────────────────────────────────
 
-def optimize_bid(row, d7_col, d2nd_col, kpi_d7, kpi_d2nd):
+def optimize_bid(row, d7_col, d2nd_col, kpi_d7, kpi_d2nd, w_d7=0.80, w_d2nd=0.20):
     floor      = row['effectiveBidFloor'] if pd.notna(row['effectiveBidFloor']) else None
     bid        = row['bidRate']
     high_tier  = row['highTier'] if pd.notna(row['highTier']) else None
@@ -231,8 +229,8 @@ def optimize_bid(row, d7_col, d2nd_col, kpi_d7, kpi_d2nd):
     spend      = row['spend']
     at_floor   = floor is not None and bid <= floor
 
-    score      = weighted_score(roi_d7, roi_d2nd)
-    target     = kpi_target(kpi_d7, kpi_d2nd)
+    score      = weighted_score(roi_d7, roi_d2nd, w_d7, w_d2nd)
+    target     = kpi_target(kpi_d7, kpi_d2nd, w_d7, w_d2nd)
     pct_above  = (score - target) / target if target > 0 else 0
     pct_below  = (target - score) / target if target > 0 else 1
 
@@ -289,18 +287,15 @@ def optimize_bid(row, d7_col, d2nd_col, kpi_d7, kpi_d2nd):
             return None, None
 
         if fill_rate > 0.80:
-            # Cap at 15%
             new_bid = round(bid * 1.15, 2)
             if high_tier is not None:
                 new_bid = round(min(new_bid, high_tier), 2)
             floored, floor_action = apply_floor(new_bid)
             return (floor_action or 'Increase bid 15%'), (floored if floor_action else new_bid)
 
-        # Fill 60–80%: still cap at 15%
         if fill_rate > 0.60:
             increase_pct = 0.15
         else:
-            # Fill ≤ 60%: normal 10/20/30%
             increase_pct = 0.10 if pct_above <= 0.25 else (0.20 if pct_above <= 0.50 else 0.30)
 
         new_bid = round(bid * (1 + increase_pct), 2)
@@ -341,10 +336,15 @@ def optimize_bid(row, d7_col, d2nd_col, kpi_d7, kpi_d2nd):
 def run_optimization(
     internal_path,
     advertiser_path,
-    kpi_col_idx_d7,    # 0-based index, e.g. 8 for column I
-    kpi_col_idx_d2nd,  # 0-based index, e.g. 10 for column K
-    kpi_d7,            # e.g. 0.0336 for 3.36%
-    kpi_d2nd,          # e.g. 0.1336 for 13.36%
+    kpi_col_idx_d7,    # 0-based index for Main KPI column
+    kpi_col_idx_d2nd,  # 0-based index for Secondary KPI column
+    kpi_d7,            # e.g. 0.10 for 10%
+    kpi_d2nd,          # e.g. 0.05 for 5%
+    w_d7=0.80,         # Main KPI weight (0–1)
+    w_d2nd=0.20,       # Secondary KPI weight (0–1)
+    optimization_type='Performance',
+    report_duration='Last 30 days',
+    notes='',
 ):
     """
     Full optimization pipeline.
@@ -368,7 +368,7 @@ def run_optimization(
     internal, dropped_count = clean_nulls(internal, d7_col, d2nd_col)
 
     # Segmentation + progression
-    internal = add_segments(internal, d7_col, d2nd_col, kpi_d7, kpi_d2nd)
+    internal = add_segments(internal, d7_col, d2nd_col, kpi_d7, kpi_d2nd, w_d7, w_d2nd)
 
     # Store roi_d7 reference for discard helper
     internal['_roi_d7'] = internal[d7_col]
@@ -383,7 +383,7 @@ def run_optimization(
 
     # Bid optimization
     results = internal.apply(
-        lambda r: pd.Series(optimize_bid(r, d7_col, d2nd_col, kpi_d7, kpi_d2nd)),
+        lambda r: pd.Series(optimize_bid(r, d7_col, d2nd_col, kpi_d7, kpi_d2nd, w_d7, w_d2nd)),
         axis=1
     )
     results.columns = ['Action', 'Recommended bid']
@@ -398,25 +398,37 @@ def run_optimization(
         'dailyCap', 'lowTier', 'midTier', 'highTier',
         d7_col, d2nd_col, 'Action', 'Recommended bid', 'Daily Cap Suggestion'
     ]
-    # Only keep columns that exist
     out_cols = [c for c in out_cols if c in internal.columns]
     output   = internal[out_cols].copy()
 
+    # Run metadata for Excel Settings sheet
+    run_meta = {
+        'optimization_type': optimization_type,
+        'report_duration':   report_duration,
+        'notes':             notes,
+        'kpi_d7':            kpi_d7,
+        'kpi_d2nd':          kpi_d2nd,
+        'w_d7':              w_d7,
+        'w_d2nd':            w_d2nd,
+        'd7_col':            d7_col,
+        'd2nd_col':          d2nd_col,
+    }
+
     # Build Excel
-    excel_bytes = build_excel(output, internal, d7_col, d2nd_col, out_cols)
+    excel_bytes = build_excel(output, internal, d7_col, d2nd_col, out_cols, run_meta)
 
     # Summary
     summary = {
-        'total_rows':       len(output),
-        'excluded':         excluded_count,
-        'dropped_nulls':    dropped_count,
-        'actioned':         int(output['Action'].notna().sum()),
-        'disregarded':      int(output['Action'].isna().sum()),
-        'daily_cap':        int(output['Daily Cap Suggestion'].notna().sum()),
-        'action_breakdown': output['Action'].value_counts().to_dict(),
+        'total_rows':        len(output),
+        'excluded':          excluded_count,
+        'dropped_nulls':     dropped_count,
+        'actioned':          int(output['Action'].notna().sum()),
+        'disregarded':       int(output['Action'].isna().sum()),
+        'daily_cap':         int(output['Daily Cap Suggestion'].notna().sum()),
+        'action_breakdown':  output['Action'].value_counts().to_dict(),
         'segment_breakdown': internal['segment'].value_counts().to_dict(),
-        'd7_col':           d7_col,
-        'd2nd_col':         d2nd_col,
+        'd7_col':            d7_col,
+        'd2nd_col':          d2nd_col,
     }
 
     return excel_bytes, summary
@@ -424,7 +436,7 @@ def run_optimization(
 
 # ─── EXCEL BUILDER ────────────────────────────────────────────────────────────
 
-def build_excel(output, internal, d7_col, d2nd_col, out_cols):
+def build_excel(output, internal, d7_col, d2nd_col, out_cols, run_meta=None):
     seg_map     = dict(zip(internal['Key'], internal['segment']))
     discard_map = dict(zip(internal['Key'], internal['discard']))
 
@@ -492,7 +504,39 @@ def build_excel(output, internal, d7_col, d2nd_col, out_cols):
     for col_idx, col_name in enumerate(out_cols, 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = col_widths.get(col_name, 12)
 
-    # No frozen panes
+    # ── Run Settings sheet ────────────────────────────────────────────────────
+    if run_meta:
+        ws2 = wb.create_sheet('Run Settings')
+        hfill = PatternFill('solid', start_color=FILLS['header'])
+        hfont = Font(bold=True, color='FFFFFF', name='Arial', size=10)
+
+        ws2.cell(1, 1, 'Setting').fill = hfill
+        ws2.cell(1, 1).font = hfont
+        ws2.cell(1, 2, 'Value').fill = hfill
+        ws2.cell(1, 2).font = hfont
+        ws2.column_dimensions['A'].width = 28
+        ws2.column_dimensions['B'].width = 55
+
+        rows = [
+            ('Run Date',               datetime.datetime.now().strftime('%Y-%m-%d %H:%M')),
+            ('Optimization Goal',      run_meta.get('optimization_type', '')),
+            ('Report Duration',        run_meta.get('report_duration', '')),
+            ('Main KPI Column',        run_meta.get('d7_col', '')),
+            ('Main KPI Target',        f"{run_meta.get('kpi_d7', 0) * 100:.2f}%"),
+            ('Main KPI Weight',        f"{run_meta.get('w_d7', 0.8) * 100:.0f}%"),
+            ('Secondary KPI Column',   run_meta.get('d2nd_col', '')),
+            ('Secondary KPI Target',   f"{run_meta.get('kpi_d2nd', 0) * 100:.2f}%"),
+            ('Secondary KPI Weight',   f"{run_meta.get('w_d2nd', 0.2) * 100:.0f}%"),
+            ('Additional Notes',       run_meta.get('notes', '')),
+        ]
+        for r_idx, (k, v) in enumerate(rows, 2):
+            ws2.cell(r_idx, 1, k).font = Font(bold=True, name='Arial', size=9)
+            cell = ws2.cell(r_idx, 2, v)
+            cell.font      = Font(name='Arial', size=9)
+            cell.alignment = Alignment(wrap_text=True)
+        for r_idx in range(2, len(rows) + 2):
+            ws2.row_dimensions[r_idx].height = 18
+
     output_buffer = BytesIO()
     wb.save(output_buffer)
     output_buffer.seek(0)
@@ -511,7 +555,6 @@ def letter_to_index(letter):
 
 
 if __name__ == '__main__':
-    # Quick test
     print("optimizer.py loaded successfully")
     print(f"Column I = index {letter_to_index('I')}")
     print(f"Column K = index {letter_to_index('K')}")
