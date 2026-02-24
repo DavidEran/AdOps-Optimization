@@ -382,13 +382,12 @@ def run_optimization(
     )
 
     # Bid optimization
-    results = internal.apply(
-        lambda r: pd.Series(optimize_bid(r, d7_col, d2nd_col, kpi_d7, kpi_d2nd, w_d7, w_d2nd)),
-        axis=1
-    )
-    results.columns = ['Action', 'Recommended bid']
-    internal['Action']          = results['Action']
-    internal['Recommended bid'] = results['Recommended bid']
+    opt_results = [
+        optimize_bid(row, d7_col, d2nd_col, kpi_d7, kpi_d2nd, w_d7, w_d2nd)
+        for _, row in internal.iterrows()
+    ]
+    internal['Action']          = [r[0] for r in opt_results]
+    internal['Recommended bid'] = [r[1] for r in opt_results]
 
     # Output columns
     out_cols = [
